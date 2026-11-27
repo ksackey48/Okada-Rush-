@@ -1,0 +1,897 @@
+
+
+import math
+import random
+import time
+import tkinter as tk
+from tkinter import font as tkfont
+
+CELL = 40              # size of one square in pixels
+LANES = 9              # lanes across the road
+ROWS = 15              # squares down the road
+WIDTH = CELL * LANES   # 360 pixels
+HEIGHT = CELL * ROWS   # 600 pixels
+PLAYER_ROW = ROWS - 1  # the okada always rides on the bottom row
+START_SPEED = 280      # gentler starting pace (ms between logic ticks)
+SPAWN_EVERY = 4        # spawn traffic every 4 ticks for a more relaxed rhythm
+START_LIVES = 3
+HIGH_SCORE_FILE = "okada_highscore.txt"
+CAR_COLOURS = [
+    "#fbc02d", "#e53935", "#1e88e5", "#8e24aa",
+    "#fb8c00", "#00897b", "#f5f5f5", "#6d4c41", "#d81b60"
+]
+KEYS = {"left": -1, "a": -1, "right": 1, "d": 1}
+
+RENDER_FPS_MS = 33     # ~30 FPS for smooth visual interpolation between ticks
+
+
+# ---------------- Logic functions (no GUI code here) ----------------
+
+def move_down(items):
+    """Return a new list with every (lane, row) moved one row down."""
+    # TODO 1: use a list comprehension
+    return [(lane, row + 1) for lane, row in items]
+
+
+def on_road(items):
+    """Keep only the items that are still on the road."""
+    # TODO 2: a list comprehension with an if part
+    return [(lane, row) for lane, row in items if row < ROWS]
+
+
+def clamp_lane(lane):
+    """Keep a lane number between 0 and LANES - 1."""
+    # TODO 3
+    return max(0, min(lane, LANES - 1))
+
+
+def spawn_cars(count):
+    """Return `count` new cars in different random lanes on row 0."""
+    lanes = random.sample(range(LANES), count)
+    return [(lane, 0) for lane in lanes]
+
+
+def cars_per_spawn(level):
+    """1 car per spawn at levels 1-2, 2 cars from level 3, 3 cars from level 6."""
+    # TODO 6
+    if level >= 6:
+        return 3
+    if level >= 3:
+        return 2
+    return 1
+
+
+def level_for(score):
+    """Level goes up every 10 points."""
+    # TODO 4
+    return score // 10 + 1
+
+
+def speed_for(level):
+    """Gradually speeds up by 15 ms per level, never faster than 90 ms."""
+    # TODO 5
+    return max(90, START_SPEED - (level - 1) * 15)
+
+
+def load_high_score():
+    """Read the saved high score, or 0 if there is none yet."""
+    try:
+        with open(HIGH_SCORE_FILE, "r") as file:
+            return int(file.read().strip())
+    except (FileNotFoundError, ValueError):
+        return 0
+
+
+def save_high_score(score):
+    """Write the new high score to the file."""
+    with open(HIGH_SCORE_FILE, "w") as file:
+        file.write(str(score))
+
+
+# ---------------- Game state ----------------
+
+player_lane = LANES // 2
+visual_lane = float(LANES // 2)
+visual_row_offset = 0.0
+cars = []
+prev_cars = []
+coins = []
+prev_coins = []
+score = 0
+level = 1
+lives = START_LIVES
+tick = 0
+high_score = load_high_score()
+running = False
+paused = False
+loop_id = None
+render_id = None
+anim_id = None
+title_anim_id = None
+last_tick_time = 0.0
+tick_duration_s = START_SPEED / 1000.0
+invincible = False
+invincible_after_id = None
+
+# Start / End animation state
+overlay_active = False
+overlay_title = ""
+overlay_subtitle = ""
+overlay_accent = "#ffd600"
+overlay_start_time = 0.0
+
+# # Challenge: Nitro — once per level, 3-second speed burst + 2x points
+nitro_active = False
+nitro_used_this_level = False
+nitro_end_id = None
+nitro_start_time = 0.0
+nitro_release_time = 0.0
+nitro_trail_history = []   # list of (lane_pos, timestamp) for blue trail
+last_level_seen = 1
+
+
+# ---------------- GUI event handlers ----------------
+
+def current_delay():
+    delay = speed_for(level)
+    return max(45, delay // 2) if nitro_active else delay
+
+
+def tick_progress():
+    """Return 0.0 to 1.0 showing progress through the current tick."""
+    if not running or paused or tick == 0 or last_tick_time <= 0.0:
+        return 1.0
+    elapsed = time.perf_counter() - last_tick_time
+    return max(0.0, min(1.0, elapsed / tick_duration_s))
+
+
+def smooth_positions(curr_items, prev_items, frac):
+    """Interpolate each (lane, row) smoothly from its previous position."""
+    prev_map = {}
+    for lane, row in prev_items:
+        prev_map.setdefault((lane, row + 1), (lane, row))
+
+    result = []
+    for lane, row in curr_items:
+        if (lane, row) in prev_map:
+            p_lane, p_row = prev_map[(lane, row)]
+        else:
+            p_lane, p_row = lane, -1.0
+        interp_row = p_row + (row - p_row) * frac
+        result.append((float(lane), interp_row))
+    return result
+
+
+def draw_road(scroll_frac):
+    """Draw road curbs and smoothly scrolling dashed lane lines."""
+    canvas.delete("road")
+
+    night = level >= 4
+    curb_a = "#e53935" if not night else "#8e24aa"
+    curb_b = "#ffffff" if not night else "#37474f"
+    line_col = "#ffffff" if not night else "#3f6ea8"
+
+    effective_tick = (tick - 1) + scroll_frac if running and not paused and tick > 0 else float(tick)
+
+    # Left and right striped road curbs
+    curb_period = 20
+    curb_offset = (effective_tick * 10.0) % (curb_period * 2)
+    for y in range(-curb_period * 2 + int(curb_offset), HEIGHT + curb_period, curb_period):
+        parity = int((y - curb_offset) // curb_period) % 2
+        colour = curb_a if parity == 0 else curb_b
+        y1 = max(0, y)
+        y2 = min(HEIGHT, y + curb_period)
+        if y2 > y1:
+            canvas.create_rectangle(0, y1, 6, y2, fill=colour, outline="", tags="road")
+            canvas.create_rectangle(WIDTH - 6, y1, WIDTH, y2, fill=colour, outline="", tags="road")
+
+    # Dashed lane dividers that scroll smoothly
+    dash_period = 40
+    offset = (effective_tick * 10.0) % dash_period
+    for lane in range(1, LANES):
+        x = lane * CELL
+        for y in range(-dash_period + int(offset), HEIGHT + dash_period, dash_period):
+            y1 = max(0, y)
+            y2 = min(HEIGHT, y + 20)
+            if y2 > y1:
+                canvas.create_line(x, y1, x, y2, fill=line_col, width=2, tags="road")
+
+
+def add_points(points):
+    """Add points (doubled during active Nitro) and update level/Nitro state."""
+    global score, level, nitro_used_this_level, last_level_seen
+    gained = points * 2 if nitro_active else points
+    score += gained
+    level = level_for(score)
+    if level > last_level_seen:
+        last_level_seen = level
+        nitro_used_this_level = False
+
+
+def update_labels():
+    if nitro_active:
+        nitro_tag = "⚡ NITRO ENABLED (2x) ⚡"
+        nitro_fg = "#40c4ff"
+    elif nitro_used_this_level:
+        nitro_tag = "[NITRO USED]"
+        nitro_fg = "#90a4ae"
+    else:
+        nitro_tag = "[NITRO READY: N]"
+        nitro_fg = "#80d8ff"
+
+    info_label.config(
+        text=f"Score: {score}   Level: {level}   Best: {high_score}   "
+    )
+    nitro_label.config(text=nitro_tag, fg=nitro_fg)
+    hearts_label.config(text="♥ " * lives)
+
+
+def draw_car(lane_pos, row_pos, colour_lane):
+    """Draw a detailed car at smooth pixel coordinates."""
+    x, y = lane_pos * CELL, row_pos * CELL
+    body_col = CAR_COLOURS[colour_lane % len(CAR_COLOURS)]
+    trim_col = "#1c252c"
+    shadow_col = "#3b4248" if level < 4 else "#141414"
+
+    canvas.create_rectangle(
+        x + 7, y + 5, x + CELL - 5, y + CELL,
+        fill=shadow_col, outline="", tags="piece"
+    )
+    canvas.create_rectangle(
+        x + 2, y + 14, x + 6, y + 20,
+        fill=body_col, outline=trim_col, width=1, tags="piece"
+    )
+    canvas.create_rectangle(
+        x + CELL - 6, y + 14, x + CELL - 2, y + 20,
+        fill=body_col, outline=trim_col, width=1, tags="piece"
+    )
+    canvas.create_rectangle(
+        x + 6, y + 2, x + CELL - 6, y + CELL - 2,
+        fill=body_col, outline=trim_col, width=1, tags="piece"
+    )
+    canvas.create_rectangle(
+        x + 9, y + 6, x + CELL - 9, y + 13,
+        fill="#263238", outline="#546e7a", width=1, tags="piece"
+    )
+    canvas.create_rectangle(
+        x + 10, y + 25, x + CELL - 10, y + 31,
+        fill="#263238", outline="#546e7a", width=1, tags="piece"
+    )
+    canvas.create_rectangle(
+        x + 9, y + 13, x + CELL - 9, y + 25,
+        fill=body_col, outline="#37474f", width=1, tags="piece"
+    )
+    canvas.create_rectangle(
+        x + 7, y + 3, x + 13, y + 6,
+        fill="#ff1744", outline="", tags="piece"
+    )
+    canvas.create_rectangle(
+        x + CELL - 13, y + 3, x + CELL - 7, y + 6,
+        fill="#ff1744", outline="", tags="piece"
+    )
+
+    # # Challenge: Night drive — yellow headlights at bottom of each car from level 4
+    if level >= 4:
+        canvas.create_oval(
+            x + 7, y + CELL - 9, x + 14, y + CELL - 3,
+            fill="#fff176", outline="", tags="piece"
+        )
+        canvas.create_oval(
+            x + CELL - 14, y + CELL - 9, x + CELL - 7, y + CELL - 3,
+            fill="#fff176", outline="", tags="piece"
+        )
+
+
+def draw_nitro_effects(lane_pos, row_pos):
+    """Draw blue activation shockwave, streaming blue trail, status banner, and release puff."""
+    global nitro_trail_history
+    now = time.perf_counter()
+    x, y = lane_pos * CELL, row_pos * CELL
+    cx = x + CELL / 2.0
+    cy = y + CELL / 2.0
+
+    # Record trail sample while Nitro is pressed/active
+    if nitro_active:
+        nitro_trail_history.append((lane_pos, now))
+    # Keep last 0.35s of trail samples
+    nitro_trail_history = [(lp, ts) for lp, ts in nitro_trail_history if now - ts <= 0.35]
+
+    # 1) Blue activation shockwave ring + "NITRO ENABLED!" callout when N is first pressed
+    if nitro_active:
+        since_press = now - nitro_start_time
+        if 0.0 <= since_press <= 0.45:
+            p = since_press / 0.45
+            radius = 12 + p * 34
+            ring_col = "#80d8ff" if p < 0.5 else "#00b0ff"
+            canvas.create_oval(
+                cx - radius, cy - radius, cx + radius, cy + radius,
+                outline=ring_col, width=3 if p < 0.5 else 2, tags="piece"
+            )
+            canvas.create_rectangle(
+                3, 3, WIDTH - 3, HEIGHT - 3,
+                outline="#40c4ff", width=3, tags="piece"
+            )
+
+        # Floating callout above the bike for the first 1.2s after enabling Nitro
+        if 0.0 <= since_press <= 1.2:
+            rise = since_press * 18
+            badge_y = max(24, y - 14 - rise)
+            badge_cx = max(78, min(WIDTH - 78, cx))
+            canvas.create_rectangle(
+                badge_cx - 72, badge_y - 10, badge_cx + 72, badge_y + 10,
+                fill="#062847", outline="#40c4ff", width=1.5, tags="piece"
+            )
+            canvas.create_text(
+                badge_cx, badge_y, text="NITRO ENABLED! 2x",
+                fill="#e1f5fe", font=("Consolas", 9, "bold"), tags="piece"
+            )
+
+    # 2) Multi-segment blue motion trail behind the motorbike
+    for lp, ts in nitro_trail_history:
+        age = now - ts
+        frac = age / 0.35
+        tx = lp * CELL + CELL / 2.0
+        ty = (row_pos * CELL) + CELL - 4 + age * 145
+        half_w = max(2.0, (1.0 - frac) * 8.0)
+        if frac < 0.33:
+            col = "#e1f5fe"
+        elif frac < 0.66:
+            col = "#40c4ff"
+        else:
+            col = "#0091ea"
+        canvas.create_oval(
+            tx - half_w, ty - half_w * 1.4, tx + half_w, ty + half_w * 1.4,
+            fill=col, outline="", tags="piece"
+        )
+
+    # 3) Sharp blue jet flame + aura while Nitro is active
+    if nitro_active:
+        flicker = 4 * abs(((now * 24) % 2.0) - 1.0)
+        canvas.create_oval(
+            x + 4, y - 2, x + CELL - 4, y + CELL + 2,
+            outline="#40c4ff", width=2, tags="piece"
+        )
+        canvas.create_polygon(
+            x + 13, y + CELL - 3,
+            cx, y + CELL + 18 + flicker,
+            x + CELL - 13, y + CELL - 3,
+            fill="#00b0ff", outline="#80d8ff", tags="piece"
+        )
+        canvas.create_polygon(
+            x + 17, y + CELL - 3,
+            cx, y + CELL + 10 + flicker * 0.5,
+            x + CELL - 17, y + CELL - 3,
+            fill="#e1f5fe", outline="", tags="piece"
+        )
+
+    # 4) Blue release puff when Nitro finishes and releases (0.0s -> 0.45s after end)
+    if not nitro_active and nitro_release_time > 0.0:
+        since_release = now - nitro_release_time
+        if 0.0 <= since_release <= 0.45:
+            rp = since_release / 0.45
+            spread = 8 + rp * 20
+            dot_r = max(1.5, (1.0 - rp) * 4.5)
+            puff_col = "#80d8ff" if rp < 0.5 else "#0288d1"
+            for dx, dy in [(-spread, 8), (spread, 8), (-spread * 0.6, 18), (spread * 0.6, 18)]:
+                px = cx + dx
+                py = y + CELL + dy * rp
+                canvas.create_oval(
+                    px - dot_r, py - dot_r, px + dot_r, py + dot_r,
+                    fill=puff_col, outline="", tags="piece"
+                )
+
+
+def draw_motorbike(lane_pos, row_pos, launch_boost=False):
+    """Draw a top-down okada motorbike with tyres, handlebars, body, and helmeted rider."""
+    x, y = lane_pos * CELL, row_pos * CELL
+
+    draw_nitro_effects(lane_pos, row_pos)
+
+    if launch_boost and not nitro_active:
+        canvas.create_polygon(
+            x + 15, y + CELL - 2,
+            x + CELL // 2, y + CELL + 16,
+            x + CELL - 15, y + CELL - 2,
+            fill="#ff6d00", outline="#ffd600", tags="piece"
+        )
+
+    canvas.create_rectangle(
+        x + 16, y + 27, x + 24, y + 38,
+        fill="#111111", outline="#37474f", width=1, tags="piece"
+    )
+    canvas.create_rectangle(
+        x + 16, y + 2, x + 24, y + 11,
+        fill="#111111", outline="#37474f", width=1, tags="piece"
+    )
+    canvas.create_oval(
+        x + 17, y + 1, x + 23, y + 5,
+        fill="#fff59d", outline="", tags="piece"
+    )
+    canvas.create_line(
+        x + 8, y + 12, x + CELL - 8, y + 12,
+        fill="#cfd8dc", width=3, tags="piece"
+    )
+    canvas.create_rectangle(
+        x + 7, y + 10, x + 10, y + 14,
+        fill="#212121", outline="", tags="piece"
+    )
+    canvas.create_rectangle(
+        x + CELL - 10, y + 10, x + CELL - 7, y + 14,
+        fill="#212121", outline="", tags="piece"
+    )
+    canvas.create_oval(
+        x + 14, y + 11, x + CELL - 14, y + 29,
+        fill="#2e7d32", outline="#1b5e20", width=1, tags="piece"
+    )
+    canvas.create_oval(
+        x + 11, y + 16, x + CELL - 11, y + 27,
+        fill="#43a047", outline="#1b5e20", width=1, tags="piece"
+    )
+    canvas.create_oval(
+        x + 13, y + 13, x + CELL - 13, y + 23,
+        fill="#66bb6a", outline="#e8f5e9", width=1.5, tags="piece"
+    )
+    canvas.create_arc(
+        x + 14, y + 13, x + CELL - 14, y + 20,
+        start=0, extent=180, fill="#263238", outline="", tags="piece"
+    )
+
+
+def draw_animated_overlay():
+    """Draw a cool sliding/pulsing banner card for start, pause, or game over."""
+    canvas.delete("message")
+    if not overlay_active:
+        return
+
+    elapsed = time.perf_counter() - overlay_start_time
+    slide_t = min(1.0, elapsed / 0.35)
+    eased = 1.0 - (1.0 - slide_t) ** 3
+    y_offset = int((-180) * (1.0 - eased))
+
+    pulse = 0.5 + 0.5 * abs(((elapsed * 2.2) % 2.0) - 1.0)
+    x1 = 12
+    x2 = WIDTH - 12
+    y1 = HEIGHT // 2 - 64 + y_offset
+    y2 = HEIGHT // 2 + 54 + y_offset
+
+    canvas.create_rectangle(
+        x1 + 4, y1 + 4, x2 + 4, y2 + 4,
+        fill="#05080f", outline="", tags="message"
+    )
+    canvas.create_rectangle(
+        x1, y1, x2, y2,
+        fill="#0d1b2a", outline=overlay_accent, width=2 if pulse > 0.5 else 1, tags="message"
+    )
+    canvas.create_rectangle(
+        x1, y1, x2, y1 + 5,
+        fill=overlay_accent, outline="", tags="message"
+    )
+
+    chevron_col = "#ffd600" if pulse > 0.4 else "#90a4ae"
+    canvas.create_text(x1 + 18, (y1 + y2) // 2 + 2, text="»", fill=chevron_col,
+                       font=("Consolas", 16, "bold"), tags="message")
+    canvas.create_text(x2 - 18, (y1 + y2) // 2 + 2, text="«", fill=chevron_col,
+                       font=("Consolas", 16, "bold"), tags="message")
+
+    canvas.create_text(
+        WIDTH // 2, y1 + 38, text=overlay_title, fill=overlay_accent,
+        font=("Segoe UI", 19, "bold"), tags="message"
+    )
+    canvas.create_text(
+        WIDTH // 2, y1 + 76, text=overlay_subtitle, fill="#e0e6ed",
+        font=("Segoe UI", 10), tags="message"
+    )
+
+
+def show_message(title, subtitle, accent="#ffd600"):
+    global overlay_active, overlay_title, overlay_subtitle, overlay_accent, overlay_start_time
+    overlay_active = True
+    overlay_title = title
+    overlay_subtitle = subtitle
+    overlay_accent = accent
+    overlay_start_time = time.perf_counter()
+    draw_animated_overlay()
+    start_overlay_anim()
+
+
+def hide_message():
+    global overlay_active
+    overlay_active = False
+    stop_overlay_anim()
+    canvas.delete("message")
+
+
+def overlay_anim_loop():
+    global anim_id
+    if overlay_active:
+        draw_animated_overlay()
+        anim_id = root.after(RENDER_FPS_MS, overlay_anim_loop)
+    else:
+        anim_id = None
+
+
+def start_overlay_anim():
+    global anim_id
+    if anim_id is not None:
+        root.after_cancel(anim_id)
+    anim_id = root.after(RENDER_FPS_MS, overlay_anim_loop)
+
+
+def stop_overlay_anim():
+    global anim_id
+    if anim_id is not None:
+        root.after_cancel(anim_id)
+        anim_id = None
+
+
+def draw(launching=False):
+    """Clear the old pieces, then draw cars, coins and the okada smoothly."""
+    global visual_lane, visual_row_offset
+    canvas.delete("piece")
+
+    # # Challenge: Night drive — switch road to dark blue from level 4; bright daylight below level 4
+    if level >= 4:
+        canvas.configure(bg="#0b1d3a")
+    else:
+        canvas.configure(bg="#545d66")
+
+    frac = tick_progress()
+    draw_road(frac)
+
+    smooth_coins = smooth_positions(coins, prev_coins, frac)
+    for c_lane, c_row in smooth_coins:
+        x, y = c_lane * CELL, c_row * CELL
+        canvas.create_oval(
+            x + 10, y + 10, x + CELL - 10, y + CELL - 10,
+            fill="#ffd600", outline="#ff8f00", width=2, tags="piece"
+        )
+
+    smooth_cars = smooth_positions(cars, prev_cars, frac)
+    for (car_lane, _), (s_lane, s_row) in zip(cars, smooth_cars):
+        draw_car(s_lane, s_row, car_lane)
+
+    # Smooth horizontal glide toward target lane
+    diff = float(player_lane) - visual_lane
+    if abs(diff) < 0.03:
+        visual_lane = float(player_lane)
+    else:
+        visual_lane += diff * 0.45
+
+    # Smooth vertical roll-in when launching a game
+    if abs(visual_row_offset) > 0.02:
+        visual_row_offset *= 0.72
+    else:
+        visual_row_offset = 0.0
+
+    # # Challenge: Safe after a crash — flash okada while invincible
+    flash_skip = invincible and (int(time.perf_counter() * 14) % 2 == 1)
+    if not flash_skip:
+        draw_motorbike(
+            visual_lane,
+            float(PLAYER_ROW) + visual_row_offset,
+            launch_boost=(launching or visual_row_offset > 0.25)
+        )
+
+    if overlay_active:
+        draw_animated_overlay()
+
+    update_labels()
+
+
+def render_loop():
+    """High-FPS visual loop for smooth movement between logic ticks."""
+    global render_id
+    if running and not paused:
+        draw()
+        render_id = root.after(RENDER_FPS_MS, render_loop)
+    else:
+        render_id = None
+
+
+def start_render_loop():
+    global render_id
+    if render_id is not None:
+        root.after_cancel(render_id)
+    render_id = root.after(RENDER_FPS_MS, render_loop)
+
+
+def stop_render_loop():
+    global render_id
+    if render_id is not None:
+        root.after_cancel(render_id)
+        render_id = None
+
+
+def end_nitro():
+    global nitro_active, nitro_end_id, nitro_release_time
+    nitro_active = False
+    nitro_end_id = None
+    nitro_release_time = time.perf_counter()
+    if running and not paused:
+        update_labels()
+
+
+def activate_nitro(event=None):
+    global nitro_active, nitro_used_this_level, nitro_end_id, loop_id, tick_duration_s
+    global nitro_start_time, nitro_release_time, nitro_trail_history
+    if not running or paused or nitro_active or nitro_used_this_level:
+        return
+    nitro_active = True
+    nitro_used_this_level = True
+    nitro_start_time = time.perf_counter()
+    nitro_release_time = 0.0
+    nitro_trail_history = [(visual_lane, nitro_start_time)]
+    if nitro_end_id is not None:
+        root.after_cancel(nitro_end_id)
+    nitro_end_id = root.after(3000, end_nitro)
+    if loop_id is not None:
+        root.after_cancel(loop_id)
+    delay = current_delay()
+    tick_duration_s = delay / 1000.0
+    update_labels()
+    draw()
+    loop_id = root.after(delay, game_loop)
+
+
+def start_game(event=None):
+    global player_lane, visual_lane, visual_row_offset, cars, prev_cars, coins, prev_coins
+    global score, level, lives, tick, running, paused, loop_id, last_tick_time, tick_duration_s
+    global invincible, invincible_after_id, nitro_active, nitro_used_this_level, nitro_end_id
+    global nitro_start_time, nitro_release_time, nitro_trail_history, last_level_seen
+
+    hide_message()
+
+    if loop_id is not None:
+        root.after_cancel(loop_id)
+    if invincible_after_id is not None:
+        root.after_cancel(invincible_after_id)
+        invincible_after_id = None
+    if nitro_end_id is not None:
+        root.after_cancel(nitro_end_id)
+        nitro_end_id = None
+
+    invincible = False
+    nitro_active = False
+    nitro_used_this_level = False
+    nitro_start_time = 0.0
+    nitro_release_time = 0.0
+    nitro_trail_history = []
+    last_level_seen = 1
+    player_lane = LANES // 2
+    visual_lane = float(LANES // 2)
+    visual_row_offset = 1.6  # bike rolls forward onto bottom row with exhaust boost
+    cars = []
+    prev_cars = []
+    coins = []
+    prev_coins = []
+    score = 0
+    level = 1
+    lives = START_LIVES
+    tick = 0
+    running = True
+    paused = False
+    delay = current_delay()
+    tick_duration_s = delay / 1000.0
+    last_tick_time = time.perf_counter()
+    draw(launching=True)
+    start_render_loop()
+    loop_id = root.after(delay, game_loop)
+
+
+def check_hits():
+    """Handle the okada touching a car or a coin. Returns False if the game ended."""
+    # TODO 9
+    me = (player_lane, PLAYER_ROW)
+
+    if me in coins:
+        coins.remove(me)
+        add_points(3)
+
+    if me in cars and not invincible:
+        cars.remove(me)
+        return lose_life()
+
+    return True
+
+
+def game_loop():
+    """One tick: move, remove, score, spawn, check hits, draw, schedule."""
+    global cars, prev_cars, coins, prev_coins, tick, loop_id, last_tick_time, tick_duration_s
+    # TODO 8: write the tick here (see the lab sheet for the 6 jobs)
+    tick += 1
+    last_tick_time = time.perf_counter()
+
+    prev_cars = list(cars)
+    prev_coins = list(coins)
+
+    moved = move_down(cars)
+    cars = on_road(moved)
+
+    dodged = len(moved) - len(cars)
+    add_points(dodged)
+
+    coins = on_road(move_down(coins))
+
+    if tick % SPAWN_EVERY == 0:
+        new_cars = spawn_cars(cars_per_spawn(level))
+        cars.extend(new_cars)
+        if random.random() < 0.30:
+            blocked_lanes = {lane for lane, _ in new_cars}
+            free_lanes = [lane for lane in range(LANES) if lane not in blocked_lanes]
+            if free_lanes:
+                coins.append((random.choice(free_lanes), 0))
+
+    if not check_hits():
+        return
+
+    draw()
+    delay = current_delay()
+    tick_duration_s = delay / 1000.0
+    loop_id = root.after(delay, game_loop)
+
+
+def end_invincibility():
+    global invincible, invincible_after_id
+    invincible = False
+    invincible_after_id = None
+
+
+def lose_life():
+    """Take a life. Returns False if that was the last one."""
+    # TODO 10
+    global lives, invincible, invincible_after_id
+    lives -= 1
+
+    if lives <= 0:
+        game_over()
+        return False
+
+    # # Challenge: Safe after a crash — 1.5s invincibility after losing a life
+    invincible = True
+    if invincible_after_id is not None:
+        root.after_cancel(invincible_after_id)
+    invincible_after_id = root.after(1500, end_invincibility)
+
+    return True
+
+
+def on_key(event):
+    """Move the okada one lane left or right."""
+    # TODO 7
+    global player_lane
+    step = KEYS.get(event.keysym.lower())
+    if step is None or not running or paused:
+        return
+    player_lane = clamp_lane(player_lane + step)
+    if check_hits():
+        draw()
+
+
+def on_space(event=None):
+    if not running:
+        start_game()
+
+
+def toggle_pause(event=None):
+    global paused, loop_id, nitro_end_id, last_tick_time
+    if not running:
+        return
+    paused = not paused
+    if paused:
+        stop_render_loop()
+        if loop_id is not None:
+            root.after_cancel(loop_id)
+            loop_id = None
+        if nitro_end_id is not None:
+            root.after_cancel(nitro_end_id)
+            nitro_end_id = None
+        draw()
+        show_message("PAUSED", "Press P to continue", accent="#4fc3f7")
+    else:
+        hide_message()
+        last_tick_time = time.perf_counter()
+        if nitro_active:
+            nitro_end_id = root.after(3000, end_nitro)
+        start_render_loop()
+        loop_id = root.after(current_delay(), game_loop)
+
+
+def game_over():
+    global running, high_score, loop_id, invincible, invincible_after_id, nitro_active, nitro_end_id
+    running = False
+    invincible = False
+    nitro_active = False
+    stop_render_loop()
+    if invincible_after_id is not None:
+        root.after_cancel(invincible_after_id)
+        invincible_after_id = None
+    if nitro_end_id is not None:
+        root.after_cancel(nitro_end_id)
+        nitro_end_id = None
+    # TODO 10 (part 2): stop the game loop here
+    if loop_id is not None:
+        root.after_cancel(loop_id)
+        loop_id = None
+    draw()
+    if score > high_score:
+        high_score = score
+        save_high_score(high_score)
+        show_message("NEW HIGH SCORE!", f"You scored {score}. Space = play again", accent="#ffd600")
+    else:
+        show_message("GAME OVER", f"You scored {score}. Space = play again", accent="#ff5252")
+    update_labels()
+
+
+def animate_title():
+    """Subtle gold-to-amber gleam pulse on the main title."""
+    global title_anim_id
+    wave = 0.5 + 0.5 * ((1.0 + math.sin(time.perf_counter() * 3.0)) * 0.5)
+    fg_col = "#ffd600" if wave > 0.5 else "#ffb300"
+    title_label.config(fg=fg_col)
+    title_anim_id = root.after(80, animate_title)
+
+
+# ---------------- Build the window ----------------
+
+root = tk.Tk()
+root.title("Okada Rush")
+root.resizable(False, False)
+root.configure(bg="#0d1b2a")
+
+available_fonts = set(tkfont.families())
+display_family = "Impact" if "Impact" in available_fonts else "Segoe UI Black"
+
+title_frame = tk.Frame(root, bg="#0d1b2a")
+title_frame.pack(pady=(10, 2))
+
+tk.Label(
+    title_frame, text="⚡", font=("Segoe UI", 16, "bold"),
+    fg="#00b0ff", bg="#0d1b2a"
+).pack(side="left", padx=(0, 6))
+
+title_label = tk.Label(
+    title_frame, text="OKADA RUSH", font=(display_family, 26, "bold"),
+    fg="#ffd600", bg="#0d1b2a"
+)
+title_label.pack(side="left")
+
+tk.Label(
+    title_frame, text="⚡", font=("Segoe UI", 16, "bold"),
+    fg="#00b0ff", bg="#0d1b2a"
+).pack(side="left", padx=(6, 0))
+
+hud_frame = tk.Frame(root, bg="#0d1b2a")
+hud_frame.pack(pady=(0, 8))
+
+info_label = tk.Label(hud_frame, text="", font=("Consolas", 11, "bold"), fg="white", bg="#0d1b2a")
+info_label.pack(side="left")
+
+nitro_label = tk.Label(hud_frame, text="", font=("Consolas", 11, "bold"), fg="#80d8ff", bg="#0d1b2a")
+nitro_label.pack(side="left", padx=(4, 6))
+
+hearts_label = tk.Label(hud_frame, text="", font=("Segoe UI", 12, "bold"), fg="#ff2a4b", bg="#0d1b2a")
+hearts_label.pack(side="left")
+
+canvas = tk.Canvas(root, width=WIDTH, height=HEIGHT, bg="#545d66", highlightthickness=0)
+canvas.pack(padx=15)
+
+tk.Label(
+    root, text="← → or A D = move    N = nitro    P = pause    Space = start",
+    fg="#90a4ae", bg="#0d1b2a"
+).pack(pady=8)
+
+root.bind("<Key>", on_key)
+root.bind("<space>", on_space)
+root.bind("n", activate_nitro)
+root.bind("N", activate_nitro)
+root.bind("p", toggle_pause)
+root.bind("P", toggle_pause)
+
+draw_road(0.0)
+update_labels()
+show_message("Okada Rush", "Press Space to start", accent="#ffd600")
+animate_title()
+root.mainloop()
+canvas.configure(bg="#b71c1c")
+    root.after(120, lambda: canvas.configure(bg="#0b1d3a" if level >= 4 else "#545d66"))
+
